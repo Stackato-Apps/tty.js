@@ -38,6 +38,68 @@ var window = this
   , document = this.document;
 
 /**
+ * EventEmitter
+ */
+
+function EventEmitter() {
+  this._events = {};
+}
+
+EventEmitter.prototype.addListener = function(type, listener) {
+  this._events[type] = this._events[type] || [];
+  this._events[type].push(listener);
+};
+
+EventEmitter.prototype.on = EventEmitter.prototype.addListener;
+
+EventEmitter.prototype.removeListener = function(type, listener) {
+  if (!this._events[type]) return;
+
+  var obj = this._events[type]
+    , i = obj.length;
+
+  while (i--) {
+    if (obj[i] === listener || obj[i].listener === listener) {
+      obj.splice(i, 1);
+      return;
+    }
+  }
+};
+
+EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
+
+EventEmitter.prototype.removeAllListeners = function(type) {
+  if (this._events[type]) delete this._events[type];
+};
+
+EventEmitter.prototype.once = function(type, listener) {
+  function on() {
+    var args = Array.prototype.slice.call(arguments);
+    this.removeListener(type, on);
+    return listener.apply(this, args);
+  }
+  on.listener = listener;
+  return this.on(type, on);
+};
+
+EventEmitter.prototype.emit = function(type) {
+  if (!this._events[type]) return;
+
+  var args = Array.prototype.slice.call(arguments, 1)
+    , obj = this._events[type]
+    , l = obj.length
+    , i = 0;
+
+  for (; i < l; i++) {
+    obj[i].apply(this, args);
+  }
+};
+
+EventEmitter.prototype.listeners = function(type) {
+  return this._events[type] = this._events[type] || [];
+};
+
+/**
  * States
  */
 
@@ -54,9 +116,23 @@ var normal = 0
  */
 
 function Terminal(cols, rows, handler) {
-  this.cols = cols;
-  this.rows = rows;
-  if (handler) this.handler = handler;
+  EventEmitter.call(this);
+
+  var options;
+  if (typeof cols === 'object') {
+    options = cols;
+    cols = options.cols;
+    rows = options.rows;
+    handler = options.handler;
+  }
+  this._options = options || {};
+
+  this.cols = cols || Terminal.geometry[0];
+  this.rows = rows || Terminal.geometry[1];
+
+  if (handler) {
+    this.on('data', handler);
+  }
 
   this.ybase = 0;
   this.ydisp = 0;
@@ -75,8 +151,13 @@ function Terminal(cols, rows, handler) {
   this.originMode = false;
   this.insertMode = false;
   this.wraparoundMode = false;
-  this.charset = null;
   this.normal = null;
+
+  // charset
+  this.charset = null;
+  this.gcharset = null;
+  this.glevel = 0;
+  this.charsets = [null];
 
   // mouse properties
   this.decLocator;
@@ -99,6 +180,10 @@ function Terminal(cols, rows, handler) {
   this.savedY;
   this.savedCols;
 
+  // stream
+  this.readable = true;
+  this.writable = true;
+
   this.defAttr = (257 << 9) | 256;
   this.curAttr = this.defAttr;
 
@@ -116,6 +201,8 @@ function Terminal(cols, rows, handler) {
   this.tabs;
   this.setupStops();
 }
+
+inherits(Terminal, EventEmitter);
 
 /**
  * Colors
@@ -189,7 +276,7 @@ Terminal.colors[257] = Terminal.defaultColors.fg;
  */
 
 Terminal.termName = 'xterm';
-Terminal.geometry = [80, 30];
+Terminal.geometry = [80, 24];
 Terminal.cursorBlink = true;
 Terminal.visualBell = false;
 Terminal.popOnBell = false;
@@ -310,6 +397,8 @@ Terminal.prototype.open = function() {
   // sync default bg/fg colors
   this.element.style.backgroundColor = Terminal.defaultColors.bg;
   this.element.style.color = Terminal.defaultColors.fg;
+
+  //this.emit('open');
 };
 
 // XTerm mouse events
@@ -404,6 +493,12 @@ Terminal.prototype.bindMouse = function() {
   // vt300: ^[[ 24(1/3/5)~ [ Cx , Cy ] \r
   // locator: CSI P e ; P b ; P r ; P c ; P p & w
   function sendEvent(button, pos) {
+    // self.emit('mouse', {
+    //   x: pos.x - 32,
+    //   y: pos.x - 32,
+    //   button: button
+    // });
+
     if (self.vt300Mouse) {
       // NOTE: Unstable.
       // http://www.vt100.net/docs/vt3xx-gp/chapter15.html
@@ -639,6 +734,19 @@ Terminal.prototype.bindMouse = function() {
 };
 
 /**
+ * Destroy Terminal
+ */
+
+Terminal.prototype.destroy = function() {
+  this.readable = false;
+  this.writable = false;
+  this._events = {};
+  this.handler = function() {};
+  this.write = function() {};
+  //this.emit('close');
+};
+
+/**
  * Rendering Engine
  */
 
@@ -861,6 +969,7 @@ Terminal.prototype.scrollDisp = function(disp) {
 Terminal.prototype.write = function(data) {
   var l = data.length
     , i = 0
+    , cs
     , ch;
 
   this.refreshStart = this.y;
@@ -919,12 +1028,14 @@ Terminal.prototype.write = function(data) {
             break;
 
           // shift out
-          // case '\x0e':
-          //   break;
+          case '\x0e':
+            this.setgLevel(1);
+            break;
 
           // shift in
-          // case '\x0f':
-          //   break;
+          case '\x0f':
+            this.setgLevel(0);
+            break;
 
           // '\e'
           case '\x1b':
@@ -1007,7 +1118,9 @@ Terminal.prototype.write = function(data) {
           // ESC % Select default/utf-8 character set.
           // @ = default, G = utf-8
           case '%':
-            this.charset = null;
+            //this.charset = null;
+            this.setgLevel(0);
+            this.setgCharset(0, Terminal.charsets.US);
             this.state = normal;
             i++;
             break;
@@ -1019,6 +1132,26 @@ Terminal.prototype.write = function(data) {
           case '+':
           case '-':
           case '.':
+            switch (ch) {
+              case '(':
+                this.gcharset = 0;
+                break;
+              case ')':
+                this.gcharset = 1;
+                break;
+              case '*':
+                this.gcharset = 2;
+                break;
+              case '+':
+                this.gcharset = 3;
+                break;
+              case '-':
+                this.gcharset = 1;
+                break;
+              case '.':
+                this.gcharset = 2;
+                break;
+            }
             this.state = charset;
             break;
 
@@ -1026,9 +1159,45 @@ Terminal.prototype.write = function(data) {
           // A = ISO Latin-1 Supplemental.
           // Not implemented.
           case '/':
-            this.charset = null;
-            this.state = normal;
-            i++;
+            this.gcharset = 3;
+            this.state = charset;
+            i--;
+            break;
+
+          // ESC N
+          // Single Shift Select of G2 Character Set
+          // ( SS2 is 0x8e). This affects next character only.
+          case 'N':
+            break;
+          // ESC O
+          // Single Shift Select of G3 Character Set
+          // ( SS3 is 0x8f). This affects next character only.
+          case 'O':
+            break;
+          // ESC n
+          // Invoke the G2 Character Set as GL (LS2).
+          case 'n':
+            this.setgLevel(2);
+            break;
+          // ESC o
+          // Invoke the G3 Character Set as GL (LS3).
+          case 'o':
+            this.setgLevel(3);
+            break;
+          // ESC |
+          // Invoke the G3 Character Set as GR (LS3R).
+          case '|':
+            this.setgLevel(3);
+            break;
+          // ESC }
+          // Invoke the G2 Character Set as GR (LS2R).
+          case '}':
+            this.setgLevel(2);
+            break;
+          // ESC ~
+          // Invoke the G1 Character Set as GR (LS1R).
+          case '~':
+            this.setgLevel(1);
             break;
 
           // ESC 7 Save Cursor (DECSC).
@@ -1077,16 +1246,58 @@ Terminal.prototype.write = function(data) {
 
       case charset:
         switch (ch) {
-          // DEC Special Character and Line Drawing Set.
-          case '0':
-            this.charset = SCLD;
+          case '0': // DEC Special Character and Line Drawing Set.
+            cs = Terminal.charsets.SCLD;
             break;
-          // United States (USASCII).
-          case 'B':
-          default:
-            this.charset = null;
+          case 'A': // UK
+            cs = Terminal.charsets.UK;
+            break;
+          case 'B': // United States (USASCII).
+            cs = Terminal.charsets.US;
+            break;
+          case '4': // Dutch
+            cs = Terminal.charsets.Dutch;
+            break;
+          case 'C': // Finnish
+          case '5':
+            cs = Terminal.charsets.Finnish;
+            break;
+          case 'R': // French
+            cs = Terminal.charsets.French;
+            break;
+          case 'Q': // FrenchCanadian
+            cs = Terminal.charsets.FrenchCanadian;
+            break;
+          case 'K': // German
+            cs = Terminal.charsets.German;
+            break;
+          case 'Y': // Italian
+            cs = Terminal.charsets.Italian;
+            break;
+          case 'E': // NorwegianDanish
+          case '6':
+            cs = Terminal.charsets.NorwegianDanish;
+            break;
+          case 'Z': // Spanish
+            cs = Terminal.charsets.Spanish;
+            break;
+          case 'H': // Swedish
+          case '7':
+            cs = Terminal.charsets.Swedish;
+            break;
+          case '=': // Swiss
+            cs = Terminal.charsets.Swiss;
+            break;
+          case '/': // ISOLatin (actually /A)
+            cs = Terminal.charsets.ISOLatin;
+            i++;
+            break;
+          default: // Default
+            cs = Terminal.charsets.US;
             break;
         }
+        this.setgCharset(this.gcharset, cs);
+        this.gcharset = null;
         this.state = normal;
         break;
 
@@ -1104,7 +1315,8 @@ Terminal.prototype.write = function(data) {
             case 1:
             case 2:
               if (this.params[1]) {
-                this.handleTitle(this.params[1]);
+                this.title = this.params[1];
+                this.handleTitle(this.title);
               }
               break;
             case 3:
@@ -1730,11 +1942,18 @@ Terminal.prototype.keyDown = function(ev) {
   switch (ev.keyCode) {
     // backspace
     case 8:
+      if (ev.shiftKey) {
+        key = '\x08'; // ^H
+        break;
+      }
       key = '\x7f'; // ^?
-      //key = '\x08'; // ^H
       break;
     // tab
     case 9:
+      if (ev.shiftKey) {
+        key = '\x1b[Z';
+        break;
+      }
       key = '\t';
       break;
     // return/enter
@@ -1902,6 +2121,8 @@ Terminal.prototype.keyDown = function(ev) {
       } else if ((!isMac && ev.altKey) || (isMac && ev.metaKey)) {
         if (ev.keyCode >= 65 && ev.keyCode <= 90) {
           key = '\x1b' + String.fromCharCode(ev.keyCode + 32);
+        } else if (ev.keyCode === 192) {
+          key = '\x1b`';
         } else if (ev.keyCode >= 48 && ev.keyCode <= 57) {
           key = '\x1b' + (ev.keyCode - 48);
         }
@@ -1909,13 +2130,30 @@ Terminal.prototype.keyDown = function(ev) {
       break;
   }
 
+  this.emit('keydown', ev);
+
   if (key) {
+    this.emit('key', key, ev);
+
     this.showCursor();
     this.handler(key);
+
     return cancel(ev);
   }
 
   return true;
+};
+
+Terminal.prototype.setgLevel = function(g) {
+  this.glevel = g;
+  this.charset = this.charsets[g];
+};
+
+Terminal.prototype.setgCharset = function(g, charset) {
+  this.charsets[g] = charset;
+  if (this.glevel === g) {
+    this.charset = charset;
+  }
 };
 
 Terminal.prototype.keyPress = function(ev) {
@@ -1936,6 +2174,9 @@ Terminal.prototype.keyPress = function(ev) {
   if (!key || ev.ctrlKey || ev.altKey || ev.metaKey) return false;
 
   key = String.fromCharCode(key);
+
+  this.emit('keypress', key, ev);
+  this.emit('key', key, ev);
 
   this.showCursor();
   this.handler(key);
@@ -2148,8 +2389,13 @@ Terminal.prototype.is = function(term) {
   return (name + '').indexOf(term) === 0;
 };
 
-Terminal.prototype.handler = function() {};
-Terminal.prototype.handleTitle = function() {};
+Terminal.prototype.handler = function(data) {
+  this.emit('data', data);
+};
+
+Terminal.prototype.handleTitle = function(title) {
+  this.emit('title', title);
+};
 
 /**
  * ESC
@@ -2515,7 +2761,7 @@ Terminal.prototype.deviceStatus = function(params) {
     switch (params[0]) {
       case 6:
         // cursor position
-        this.send('\x1b['
+        this.send('\x1b[?'
           + (this.y + 1)
           + ';'
           + (this.x + 1)
@@ -2914,6 +3160,13 @@ Terminal.prototype.setMode = function(params) {
       case 1:
         this.applicationKeypad = true;
         break;
+      case 2:
+        this.setgCharset(0, Terminal.charsets.US);
+        this.setgCharset(1, Terminal.charsets.US);
+        this.setgCharset(2, Terminal.charsets.US);
+        this.setgCharset(3, Terminal.charsets.US);
+        // set VT100 mode here
+        break;
       case 3: // 132 col mode
         this.savedCols = this.cols;
         this.resize(132, this.rows);
@@ -2985,6 +3238,10 @@ Terminal.prototype.setMode = function(params) {
             scrollTop: this.scrollTop,
             scrollBottom: this.scrollBottom,
             tabs: this.tabs
+            // XXX save charset(s) here?
+            // charset: this.charset,
+            // glevel: this.glevel,
+            // charsets: this.charsets
           };
           this.reset();
           this.normal = normal;
@@ -3358,6 +3615,8 @@ Terminal.prototype.softReset = function(params) {
   this.curAttr = this.defAttr;
   this.x = this.y = 0; // ?
   this.charset = null;
+  this.glevel = 0; // ??
+  this.charsets = [null]; // ??
 };
 
 // CSI Ps$ p
@@ -3791,6 +4050,8 @@ Terminal.prototype.deleteColumns = function() {
  * Character Sets
  */
 
+Terminal.charsets = {};
+
 // DEC Special Character and Line Drawing Set.
 // http://vt100.net/docs/vt102-ug/table5-13.html
 // A lot of curses apps use this if they see TERM=xterm.
@@ -3799,7 +4060,7 @@ Terminal.prototype.deleteColumns = function() {
 // reference above. xterm seems in line with the reference
 // when running vttest however.
 // The table below now uses xterm's output from vttest.
-var SCLD = {
+Terminal.charsets.SCLD = { // (0
   '`': '\u25c6', // '◆'
   'a': '\u2592', // '▒'
   'b': '\u0009', // '\t'
@@ -3833,6 +4094,20 @@ var SCLD = {
   '~': '\u00b7'  // '·'
 };
 
+Terminal.charsets.UK = null; // (A
+Terminal.charsets.US = null; // (B (USASCII)
+Terminal.charsets.Dutch = null; // (4
+Terminal.charsets.Finnish = null; // (C or (5
+Terminal.charsets.French = null; // (R
+Terminal.charsets.FrenchCanadian = null; // (Q
+Terminal.charsets.German = null; // (K
+Terminal.charsets.Italian = null; // (Y
+Terminal.charsets.NorwegianDanish = null; // (E or (6
+Terminal.charsets.Spanish = null; // (Z
+Terminal.charsets.Swedish = null; // (H or (7
+Terminal.charsets.Swiss = null; // (=
+Terminal.charsets.ISOLatin = null; // /A
+
 /**
  * Helpers
  */
@@ -3851,6 +4126,14 @@ function cancel(ev) {
   if (ev.stopPropagation) ev.stopPropagation();
   ev.cancelBubble = true;
   return false;
+}
+
+function inherits(child, parent) {
+  function f() {
+    this.constructor = child;
+  }
+  f.prototype = parent.prototype;
+  child.prototype = new f;
 }
 
 var isMac = ~navigator.userAgent.indexOf('Mac');
@@ -3875,6 +4158,13 @@ var setInterval = this.setInterval;
 /**
  * Expose
  */
+
+Terminal.EventEmitter = EventEmitter;
+Terminal.isMac = isMac;
+Terminal.inherits = inherits;
+Terminal.on = on;
+Terminal.off = off;
+Terminal.cancel = cancel;
 
 if (typeof module !== 'undefined') {
   module.exports = Terminal;

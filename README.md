@@ -60,11 +60,13 @@ JSON file. An example configuration file looks like:
   "static": "./static",
   "limitGlobal": 10000,
   "limitPerUser": 1000,
-  "hooks": "./hooks.js",
   "cwd": ".",
+  "syncSession": false,
+  "sessionTimeout": 600000,
+  "log": true,
   "term": {
     "termName": "xterm",
-    "geometry": [80, 30],
+    "geometry": [80, 24],
     "scrollback": 1000,
     "visualBell": false,
     "popOnBell": false,
@@ -78,7 +80,7 @@ JSON file. An example configuration file looks like:
       "#3465a4",
       "#75507b",
       "#06989a",
-      "#d3d7cf"
+      "#d3d7cf",
       "#555753",
       "#ef2929",
       "#8ae234",
@@ -86,7 +88,7 @@ JSON file. An example configuration file looks like:
       "#729fcf",
       "#ad7fa8",
       "#34e2e2",
-      "#eeeeec",
+      "#eeeeec"
     ]
   }
 }
@@ -98,19 +100,6 @@ Usernames and passwords can be plaintext or sha1 hashes.
 
 If tty.js fails to check your terminfo properly, you can force your `TERM`
 to `xterm-256color` by setting `"termName": "xterm-256color"` in your config.
-
-### Example Hooks File
-
-``` js
-var db = require('./db');
-
-module.exports = {
-  auth: function(user, pass, next) {
-    // Do database auth
-    next(null, pass === password);
-  }
-};
-```
 
 ## Security
 
